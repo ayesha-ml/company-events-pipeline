@@ -1,4 +1,6 @@
 import os
+import json
+
 import asyncpg
 from dotenv import load_dotenv
 
@@ -43,10 +45,10 @@ async def save_event_record(
             """,
             company_id,
             source_id,
-            raw_payload,
-            normalized_data,
-            consensus_data,
-            audit_metadata,
+            json.dumps(raw_payload),
+            json.dumps(normalized_data),
+            json.dumps(consensus_data),
+            json.dumps(audit_metadata),
             retrieved_at,
             expires_at,
         )
