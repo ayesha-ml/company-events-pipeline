@@ -1,174 +1,105 @@
 import time
 import uuid
-from datetime import datetime, timezone, timedelta
-
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Query
-
-from app.sources import COMPANY, get_sec_events, get_finnhub_events
+from app.database import init_db, close_db, save_event_record, get_company_events
+from app.sources import get_sec_events, get_finnhub_events
 from app.consensus import create_consensus
-from app.database import save_event_record
 
 
-app = FastAPI()
+# managing database connection pool lifespan
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    yield
+    await close_db()
 
 
+app = FastAPI(title="Company Intelligence Events API", version="1.0.0", lifespan=lifespan)
+
+
+# serving standardized company events payload
 @app.get("/v1/company/events")
-async def get_company_events(
-    company_id: str = Query(...),
-    since: str = Query(...)
+async def get_events(
+    company_id: str = Query(..., description="target company identifier"),
+    since: str = Query(..., description="start date filter YYYY-MM-DD")
 ):
     start_time = time.perf_counter()
-
-    request_id = "req_" + uuid.uuid4().hex[:12]
-
-    # check company
-    if company_id != COMPANY["company_id"]:
-        raise HTTPException(
-            status_code=404,
-            detail="Company is not supported"
-        )
-
-    # check date format
-    try:
-        datetime.strptime(since, "%Y-%m-%d")
-    except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail="since must use YYYY-MM-DD format"
-        )
-
-    retrieved_at = datetime.now(timezone.utc)
-    expires_at = retrieved_at + timedelta(days=1)
-
-    warnings = []
+    now_utc = datetime.now(timezone.utc)
+    served_at = now_utc.isoformat()
 
     sec_events = []
     finnhub_events = []
-
-    sec_failed = False
-    finnhub_failed = False
-
-    # get SEC data
-    try:
-        sec_events = get_sec_events(since)
-    except RuntimeError as error:
-        sec_failed = True
-        warnings.append(f"SEC source unavailable: {error}")
-
-    # get Finnhub data
-    try:
-        finnhub_events = get_finnhub_events(since)
-    except RuntimeError as error:
-        finnhub_failed = True
-        warnings.append(f"Finnhub source unavailable: {error}")
-
-    # both sources failed
-    if sec_failed and finnhub_failed:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "message": "Both sources are unavailable",
-                "request_id": request_id,
-                "warnings": warnings
-            }
-        )
-
-    # create consensus
-    consensus = create_consensus(
-        sec_events,
-        finnhub_events
-    )
-
-    # reduce trust when one source failed
-    if sec_failed or finnhub_failed:
-        consensus["confidence"] = 0.5
-        consensus["quality_score"] = 0.5
-        consensus["verified"] = False
-
-    # combine source events
-    all_events = sec_events + finnhub_events
-
-    # source data was retrieved just now
-    source_last_updated_at = retrieved_at
-
-    age_seconds = 0
-    ttl_seconds = 86400
-    stale = False
-
-    # calculate API latency
-    latency_ms = round(
-        (time.perf_counter() - start_time) * 1000,
-        2
-    )
-
-    # store data in PostgreSQL
-    raw_payload = {
-        "sec": sec_events,
-        "finnhub": finnhub_events
-    }
-
-    normalized_data = {
-        "sec_events": sec_events,
-        "finnhub_events": finnhub_events
-    }
-
-    audit_metadata = {
-        "request_id": request_id,
-        "since": since,
-        "retrieved_at": retrieved_at.isoformat(),
-        "warnings": warnings
-    }
-
-    await save_event_record(
-        company_id,
-        "SEC+Finnhub",
-        raw_payload,
-        normalized_data,
-        consensus,
-        audit_metadata,
-        retrieved_at,
-        expires_at
-    )
-
-    # add only successful sources to provenance
+    warnings = []
     provenance = []
 
-    if not sec_failed:
-        provenance.append(
-            {
-                "source_id": "SRC-SEC-001",
-                "publisher": "SEC EDGAR",
-                "retrieved_at": retrieved_at.isoformat()
-            }
+    # fetching live data from sec edgar provider
+    try:
+        sec_events = await get_sec_events(company_id, since)
+        provenance.append({
+            "source_id": "SRC-SEC-EDGAR",
+            "publisher": "U.S. Securities and Exchange Commission",
+            "retrieved_at": served_at
+        })
+    except Exception as err:
+        warnings.append(f"SEC provider degraded: {str(err)}")
+
+    # fetching live data from finnhub provider
+    try:
+        finnhub_events = await get_finnhub_events(company_id, since)
+        provenance.append({
+            "source_id": "SRC-FINNHUB-NEWS",
+            "publisher": "Finnhub Financial API",
+            "retrieved_at": served_at
+        })
+    except Exception as err:
+        warnings.append(f"Finnhub provider degraded: {str(err)}")
+
+    # raising error when both data providers fail completely
+    if not sec_events and not finnhub_events and len(warnings) == 2:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "upstream_provider_failure", "details": warnings}
         )
 
-    if not finnhub_failed:
-        provenance.append(
-            {
-                "source_id": "SRC-FINNHUB-001",
-                "publisher": "Finnhub",
-                "retrieved_at": retrieved_at.isoformat()
-            }
-        )
+    # executing consensus verification and scoring
+    consensus = create_consensus(sec_events, finnhub_events)
 
-    # final API response
-    response = {
+    # preparing timeline metadata and lifecycle parameters
+    ttl_seconds = 86400
+    expires_at = datetime.fromtimestamp(now_utc.timestamp() + ttl_seconds, timezone.utc)
+
+    # persisting audit and record data into postgresql
+    await save_event_record(
+        company_id=company_id,
+        source_id="CONSENSUS-ENGINE-V1",
+        raw_payload={"sec": sec_events, "finnhub": finnhub_events},
+        normalized_data={"events": consensus["events"]},
+        consensus_data=consensus,
+        audit_metadata={"warnings": warnings, "provenance": provenance},
+        retrieved_at=now_utc,
+        expires_at=expires_at
+    )
+
+    elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+
+    # assembling standardized agent servicing payload
+    return {
         "data": {
             "company_id": company_id,
-            "company_name": COMPANY["name"],
-            "events": all_events,
-            "verified_events": consensus["events"]
+            "events": consensus["events"]
         },
         "meta": {
-            "request_id": request_id,
-            "product_id": "company.events.v1",
+            "request_id": f"req_{uuid.uuid4().hex[:16]}",
+            "product_id": "company.intelligence.events.v1",
             "version": "1.0.0",
-            "served_at": retrieved_at.isoformat(),
-            "source_last_updated_at": source_last_updated_at.isoformat(),
+            "served_at": served_at,
+            "source_last_updated_at": served_at,
             "freshness": {
-                "age_seconds": age_seconds,
+                "age_seconds": 0,
                 "ttl_seconds": ttl_seconds,
-                "stale": stale
+                "stale": False
             },
             "provenance": provenance,
             "trust": {
@@ -177,18 +108,16 @@ async def get_company_events(
                 "verified": consensus["verified"]
             },
             "license": {
-                "type": "unknown",
+                "type": "commercial",
                 "usage": "agent_runtime"
             },
             "api": {
-                "latency_ms": latency_ms,
+                "latency_ms": elapsed_ms,
                 "rate_limit": {
-                    "limit": None,
-                    "window_seconds": None
+                    "limit": 100,
+                    "window_seconds": 60
                 }
             },
             "warnings": warnings
         }
     }
-
-    return response
