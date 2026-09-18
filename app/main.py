@@ -7,7 +7,6 @@ from app.database import init_db, close_db, save_event_record, get_company_event
 from app.sources import get_sec_events, get_finnhub_events
 from app.consensus import create_consensus
 
-
 # managing database connection pool lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
